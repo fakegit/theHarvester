@@ -1,199 +1,235 @@
-from theHarvester.discovery.constants import *
-from theHarvester.lib.core import *
-from theHarvester.parsers import myparser
-import asyncio
+from __future__ import annotations
+
+import base64
+import logging
+import math
 import re
+from ipaddress import ip_address
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+from theHarvester.discovery.constants import MissingKey
+from theHarvester.discovery.provider_response import provider_http_error
+from theHarvester.lib.core import AsyncFetcher, Core, FetcherResponse
+from theHarvester.lib.hostnames import normalize_hostname, normalize_scoped_hostname
+from theHarvester.lib.source_execution import SourceExecutionReport, SourceReportStatus
+from theHarvester.parsers import myparser
+
+logger = logging.getLogger(__name__)
 
 
 class SearchZoomEye:
-
-    def __init__(self, word, limit):
-        self.word = word
-        self.limit = limit
-        self.key = Core.zoomeye_key()
-        if self.key is None:
-            raise MissingKey('zoomeye')
-        self.baseurl = 'https://api.zoomeye.org/host/search'
-        self.proxy = False
-        self.totalasns = list()
-        self.totalhosts = list()
-        self.interestingurls = list()
-        self.totalips = list()
-        self.totalemails = list()
-        # Regex used is directly from: https://github.com/GerbenJavado/LinkFinder/blob/master/linkfinder.py#L29
-        # Maybe one day it will be a pip package
-        # Regardless LinkFinder is an amazing tool!
-        self.iurl_regex = r"""
-          (?:"|')                               # Start newline delimiter
-          (
-            ((?:[a-zA-Z]{1,10}://|//)           # Match a scheme [a-Z]*1-10 or //
-            [^"'/]{1,}\.                        # Match a domainname (any character + dot)
-            [a-zA-Z]{2,}[^"']{0,})              # The domainextension and/or path
-            |
-            ((?:/|\.\./|\./)                    # Start with /,../,./
-            [^"'><,;| *()(%%$^/\\\[\]]          # Next character can't be...
-            [^"'><,;|()]{1,})                   # Rest of the characters can't be
-            |
-            ([a-zA-Z0-9_\-/]{1,}/               # Relative endpoint with /
-            [a-zA-Z0-9_\-/]{1,}                 # Resource name
-            \.(?:[a-zA-Z]{1,4}|action)          # Rest + extension (length 1-4 or action)
-            (?:[\?|#][^"|']{0,}|))              # ? or # mark with parameters
-            |
-            ([a-zA-Z0-9_\-/]{1,}/               # REST API (no extension) with /
-            [a-zA-Z0-9_\-/]{3,}                 # Proper REST endpoints usually have 3+ chars
-            (?:[\?|#][^"|']{0,}|))              # ? or # mark with parameters
-            |
-            ([a-zA-Z0-9_\-]{1,}                 # filename
-            \.(?:php|asp|aspx|jsp|json|
-                 action|html|js|txt|xml)        # . + extension
-            (?:[\?|#][^"|']{0,}|))              # ? or # mark with parameters
-          )
-          (?:"|')                               # End newline delimiter
-        """
-        self.iurl_regex = re.compile(self.iurl_regex, re.VERBOSE)
-
-    async def do_search(self):
-        headers = {
-            'API-KEY': self.key,
-            'User-Agent': Core.get_user_agent()
-        }
-        params = (
-            ('query', f'site:{self.word}'),
-            ('page', '1'),
+    PAGE_SIZE = 10_000
+    RESPONSE_FIELDS = ','.join(
+        (
+            'ip',
+            'domain',
+            'hostname',
+            'rdns',
+            'asn',
+            'url',
+            'banner',
+            'header',
+            'body',
+            'ssl',
         )
-        # TODO add: https://www.zoomeye.org/profile/domain to fetch subdomains more easily once
-        # once api endpoint is created
-        response = await AsyncFetcher.fetch_all([self.baseurl], json=True, proxy=self.proxy, headers=headers,
-                                                params=params)
-        # First request determines how many pages there in total
-        resp = response[0]
-        total_pages = int(resp['available'])
-        self.limit = self.limit if total_pages > self.limit else total_pages
-        self.limit = 3 if self.limit == 2 else self.limit
-        cur_page = 2 if self.limit >= 2 else -1
-        # Means there is only one page
-        # hostnames, emails, ips, asns, iurls
-        nomatches_counter = 0
-        # cur_page = -1
-        if cur_page == -1:
-            # No need to do loop just parse and leave
-            if 'matches' in resp.keys():
-                hostnames, emails, ips, asns, iurls = await self.parse_matchs(resp['matches'])
-                self.totalhosts.extend(hostnames)
-                self.totalemails.extend(emails)
-                self.totalips.extend(ips)
-                self.totalasns.extend(asns)
-                self.interestingurls.extend(iurls)
-        else:
-            if 'matches' in resp.keys():
-                # Parse out initial results and then continue to loop
-                hostnames, emails, ips, asns, iurls = await self.parse_matchs(resp['matches'])
-                self.totalhosts.extend(hostnames)
-                self.totalemails.extend(emails)
-                self.totalips.extend(ips)
-                self.totalasns.extend(asns)
-                self.interestingurls.extend(iurls)
+    )
+    URL_PATTERN = re.compile(r'https?://[^\s"\'<>]+')
 
-            for num in range(2, self.limit):
-                print(f'Currently on page: {num}')
-                params = (
-                    ('query', f'site:{self.word}'),
-                    ('page', f'{num}'),
-                )
-                response = await AsyncFetcher.fetch_all([self.baseurl], json=True, proxy=self.proxy, headers=headers,
-                                                        params=params)
-                resp = response[0]
-                if 'matches' not in resp.keys():
-                    print(f'Your resp: {resp}')
-                    print('Match not found in keys')
-                    break
+    def __init__(self, word: str, limit: int | None) -> None:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
+            raise ValueError('ZoomEye limit must be a positive integer')
+        key = Core.zoomeye_key()
+        if not isinstance(key, str) or not key.strip():
+            raise MissingKey('zoomeye')
+        self.word = word
+        self.target = normalize_hostname(word)
+        self.limit = limit
+        self.key = key
+        self.baseurl = 'https://api.zoomeye.ai/v2/search'
+        self.proxy = False
+        self.totalasns: set[str] = set()
+        self.totalhosts: set[str] = set()
+        self.urls: set[str] = set()
+        self.totalips: set[str] = set()
+        self.totalemails: set[str] = set()
+        self._report: SourceExecutionReport | None = None
 
-                hostnames, emails, ips, asns, iurls = await self.parse_matchs(resp['matches'])
+    def _stop(self, status: SourceReportStatus, reason: str) -> None:
+        self._report = SourceExecutionReport(status, reason)
 
-                if len(hostnames) == 0 and len(emails) == 0 and len(ips) == 0 \
-                        and len(asns) == 0 and len(iurls) == 0:
-                    nomatches_counter += 1
+    def _normalize_url(self, value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = urlsplit(value.rstrip('),.;'))
+        except ValueError:
+            return None
+        hostname = normalize_scoped_hostname(parsed.hostname, self.target)
+        if parsed.scheme not in {'http', 'https'} or not parsed.netloc or hostname is None:
+            return None
+        if parsed.username is not None or parsed.password is not None:
+            return None
+        try:
+            port = f':{parsed.port}' if parsed.port is not None else ''
+        except ValueError:
+            return None
+        return urlunsplit((parsed.scheme, f'{hostname}{port}', parsed.path, parsed.query, ''))
 
-                if nomatches_counter >= 5:
-                    break
+    async def _fetch_page(self, session: Any, page: int, page_size: int) -> dict[str, Any] | None:
+        query = base64.b64encode(f'domain="{self.target}"'.encode()).decode()
+        response = await AsyncFetcher.post_fetch(
+            self.baseurl,
+            session=session,
+            json=True,
+            include_metadata=True,
+            json_body={
+                'qbase64': query,
+                'sub_type': 'all',
+                'page': page,
+                'pagesize': page_size,
+                'fields': self.RESPONSE_FIELDS,
+            },
+        )
+        if error := provider_http_error(response):
+            self._stop(*error)
+            return None
+        assert isinstance(response, FetcherResponse)
+        if not isinstance(response.body, dict):
+            self._stop('failed', 'invalid-response')
+            return None
+        if response.body.get('code') != 60000:
+            self._stop('failed', 'provider-error')
+            return None
+        data = response.body.get('data')
+        total = response.body.get('total')
+        if not isinstance(data, list) or isinstance(total, bool) or not isinstance(total, int) or total < 0:
+            self._stop('failed', 'invalid-response')
+            return None
+        return response.body
 
-                self.totalhosts.extend(hostnames)
-                self.totalemails.extend(emails)
-                self.totalips.extend(ips)
-                self.totalasns.extend(asns)
-                self.interestingurls.extend(iurls)
+    async def do_search(self, session: Any) -> None:
+        page_size = min(self.PAGE_SIZE, self.limit) if self.limit is not None else self.PAGE_SIZE
+        first = await self._fetch_page(session, 1, page_size)
+        if first is None:
+            return
+        await self._store_matches(first['data'][:page_size])
+        total = min(first['total'], self.limit) if self.limit is not None else first['total']
+        page_limit = math.ceil(total / page_size) if total else 1
+        for page in range(2, page_limit + 1):
+            remaining = self.limit - ((page - 1) * page_size) if self.limit is not None else page_size
+            response = await self._fetch_page(session, page, page_size)
+            if response is None:
+                return
+            await self._store_matches(response['data'][:remaining])
 
-                await asyncio.sleep(get_delay() + 2)
+    async def _store_matches(self, matches: list[Any]) -> None:
+        hostnames, emails, ips, asns, urls, malformed = await self.parse_matches(matches)
+        self.totalhosts.update(hostnames)
+        self.totalemails.update(emails)
+        self.totalips.update(ips)
+        self.totalasns.update(asns)
+        self.urls.update(urls)
+        if malformed:
+            self._stop('failed', 'invalid-response')
 
-    async def parse_matchs(self, matches):
-        # Helper function to parse items from match json
-        # ips = {match["ip"] for match in matches}
-        ips = set()
-        iurls = set()
-        hostnames = set()
-        asns = set()
-        emails = set()
+    async def parse_matches(
+        self,
+        matches: list[Any],
+    ) -> tuple[set[str], set[str], set[str], set[str], set[str], bool]:
+        ips: set[str] = set()
+        urls: set[str] = set()
+        hostnames: set[str] = set()
+        asns: set[str] = set()
+        emails: set[str] = set()
+        malformed = False
+
         for match in matches:
-            try:
-                ips.add(match['ip'])
+            if not isinstance(match, dict):
+                malformed = True
+                continue
+            raw_ip = match.get('ip')
+            if raw_ip is not None:
+                try:
+                    ips.add(str(ip_address(str(raw_ip).strip())))
+                except ValueError:
+                    malformed = True
 
-                if 'geoinfo' in match.keys():
-                    asns.add(int(match['geoinfo']['asn']))
+            raw_asn = match.get('asn')
+            if raw_asn is not None:
+                try:
+                    asns.add(f'AS{int(str(raw_asn).removeprefix("AS"))}')
+                except ValueError:
+                    malformed = True
 
-                if 'rdns_new' in match.keys():
-                    rdns_new = match['rdns_new']
+            for field in ('domain', 'hostname', 'rdns'):
+                value = match.get(field)
+                if value is None:
+                    continue
+                if not isinstance(value, str):
+                    malformed = True
+                elif (hostname := normalize_scoped_hostname(value, self.target)) and hostname != self.target:
+                    hostnames.add(hostname)
 
-                    if ',' in rdns_new:
-                        parts = str(rdns_new).split(',')
-                        rdns_new = parts[0]
-                        if len(parts) == 2:
-                            hostnames.add(parts[1])
-                        rdns_new = rdns_new[:-1] if rdns_new[-1] == '.' else rdns_new
-                        hostnames.add(rdns_new)
-                    else:
-                        rdns_new = rdns_new[:-1] if rdns_new[-1] == '.' else rdns_new
-                        hostnames.add(rdns_new)
+            raw_url = match.get('url')
+            if raw_url is not None:
+                if not isinstance(raw_url, str):
+                    malformed = True
+                elif normalized_url := self._normalize_url(raw_url):
+                    urls.add(normalized_url)
+                    if url_hostname := normalize_scoped_hostname(urlsplit(normalized_url).hostname, self.target):
+                        if url_hostname != self.target:
+                            hostnames.add(url_hostname)
+                else:
+                    malformed = True
 
-                if 'rdns' in match.keys():
-                    rdns = match['rdns']
-                    rdns = rdns[:-1] if rdns[-1] == '.' else rdns
-                    hostnames.add(rdns)
+            text_values: list[str] = []
+            for field in ('banner', 'header', 'body', 'ssl'):
+                value = match.get(field)
+                if value is None:
+                    continue
+                if isinstance(value, str):
+                    text_values.append(value)
+                else:
+                    malformed = True
+            if not text_values:
+                continue
+            content = '\n'.join(text_values)
+            parser = myparser.Parser(content, self.word)
+            emails.update(await parser.emails())
+            parser = myparser.Parser(content, self.word)
+            hostnames.update(hostname for hostname in await parser.hostnames() if hostname != self.target)
+            for candidate in self.URL_PATTERN.findall(content):
+                if normalized_url := self._normalize_url(candidate):
+                    urls.add(normalized_url)
 
-                if 'portinfo' in match.keys():
-                    # re.
-                    temp_emails = set(await self.parse_emails(match['portinfo']['banner']))
-                    emails.update(temp_emails)
-                    hostnames.update(set(await self.parse_hostnames(match['portinfo']['banner'])))
-                    iurls = {str(iurl.group(1)).replace('"', '') for iurl
-                             in re.finditer(self.iurl_regex, match['portinfo']['banner'])
-                             if self.word in str(iurl.group(1))}
-            except Exception as e:
-                print(f'An exception has occurred: {e}')
-        return hostnames, emails, ips, asns, iurls
+        return hostnames, emails, ips, asns, urls, malformed
 
-    async def process(self, proxy=False):
+    async def process(self, proxy: bool = False) -> SourceExecutionReport | None:
         self.proxy = proxy
-        await self.do_search()  # Only need to do it once.
+        self._report = None
+        try:
+            async with AsyncFetcher.open_session(
+                headers={'API-KEY': self.key, 'Content-Type': 'application/json'},
+                proxy=proxy,
+            ) as session:
+                await self.do_search(session)
+        except Exception as error:
+            logger.info('ZoomEye search failed: %s', type(error).__name__)
+            return SourceExecutionReport('failed', 'transport-error')
+        return self._report
 
-    async def parse_emails(self, content):
-        rawres = myparser.Parser(content, self.word)
-        return await rawres.emails()
+    async def get_hostnames(self) -> set[str]:
+        return self.totalhosts
 
-    async def parse_hostnames(self, content):
-        rawres = myparser.Parser(content, self.word)
-        return await rawres.hostnames()
+    async def get_emails(self) -> set[str]:
+        return self.totalemails
 
-    async def get_hostnames(self):
-        return set(self.totalhosts)
+    async def get_ips(self) -> set[str]:
+        return self.totalips
 
-    async def get_emails(self):
-        return set(self.totalemails)
+    async def get_asns(self) -> set[str]:
+        return self.totalasns
 
-    async def get_ips(self):
-        return set(self.totalips)
-
-    async def get_asns(self):
-        return set(self.totalasns)
-
-    async def get_interestingurls(self):
-        return set(self.interestingurls)
+    async def get_urls(self) -> set[str]:
+        return self.urls
